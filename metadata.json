@@ -1,0 +1,7 @@
+{
+  "name": "Gemini OmniChat Enterprise",
+  "description": "A fully functional enterprise-grade multimodal chatbot featuring Gemini 2.5/3.0 models, Imagen 4.0 for image generation, real-time voice conversation via Live API, and custom n8n agent integration.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
