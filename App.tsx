@@ -5,43 +5,67 @@ import {
   Sun, Moon
 } from 'lucide-react';
 
-import { Message, ChatSession, ModelId, AppSettings, MessageRole } from './types';
+import { Message, ChatSession, ModelId, AppSettings, MessageRole, N8nAgent } from './types';
 import { generateGeminiResponse } from './services/gemini';
 import { sendMessageToN8N } from './services/n8n';
 import { ChatHistory } from './components/ChatHistory';
 import { SettingsModal } from './components/SettingsModal';
+import { ModelsModal } from './components/ModelsModal';
 import { VoiceMode } from './components/VoiceMode';
 
 // Simple ID gen
 const generateId = () => Math.random().toString(36).substr(2, 9);
 
 const App: React.FC = () => {
-  // State
+  // --- Persistent Settings State (with Lazy Loading from Storage) ---
+  const [settings, setSettings] = useState<AppSettings>(() => {
+    const saved = localStorage.getItem('app_settings');
+    const defaultSettings: AppSettings = {
+      systemInstruction: 'You are a helpful, expert AI assistant.',
+      n8nAgents: [],
+      geminiApiKey: ''
+    };
+
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        // Migration and cleanup
+        if (parsed.n8nAgents) {
+          parsed.n8nAgents = parsed.n8nAgents.map((a: any) => ({
+            ...a,
+            isActive: a.isActive !== undefined ? a.isActive : true
+          }));
+        }
+        return { ...defaultSettings, ...parsed };
+      } catch (e) {
+        console.error("Failed to parse saved settings", e);
+        return defaultSettings;
+      }
+    }
+    return defaultSettings;
+  });
+
+  // --- App State ---
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<string>('');
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  
-  // Selected Model can be a ModelId enum OR a custom n8n agent ID (string)
   const [selectedModel, setSelectedModel] = useState<string>(ModelId.GEMINI_FLASH);
-  
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isModelsOpen, setIsModelsOpen] = useState(false);
   const [isVoiceModeOpen, setIsVoiceModeOpen] = useState(false);
-  const [attachedImages, setAttachedImages] = useState<string[]>([]); // Base64 strings
-
-  // Theme State
+  const [attachedImages, setAttachedImages] = useState<string[]>([]);
   const [theme, setTheme] = useState<'light' | 'dark'>('dark');
-
-  const [settings, setSettings] = useState<AppSettings>({
-    systemInstruction: 'You are a helpful, expert AI assistant.',
-    n8nAgents: []
-  });
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Initial Theme Load
+  // --- Persistence Sync Effects ---
+  useEffect(() => {
+    localStorage.setItem('app_settings', JSON.stringify(settings));
+  }, [settings]);
+
   useEffect(() => {
     const savedTheme = localStorage.getItem('app_theme') as 'light' | 'dark' | null;
     if (savedTheme) {
@@ -59,35 +83,7 @@ const App: React.FC = () => {
       document.documentElement.classList.toggle('dark', newTheme === 'dark');
   };
 
-  // Load Settings from LocalStorage
   useEffect(() => {
-      const savedSettings = localStorage.getItem('app_settings');
-      if (savedSettings) {
-          try {
-              const parsed = JSON.parse(savedSettings);
-              if (!parsed.n8nAgents && parsed.n8nWebhookUrl) {
-                  parsed.n8nAgents = [{
-                      id: 'legacy-agent',
-                      name: 'Legacy Agent',
-                      webhookUrl: parsed.n8nWebhookUrl,
-                      authToken: parsed.n8nAuthToken || 'macai'
-                  }];
-              }
-              setSettings(parsed);
-          } catch (e) {
-              console.error("Failed to load settings", e);
-          }
-      }
-  }, []);
-
-  // Save Settings
-  useEffect(() => {
-      localStorage.setItem('app_settings', JSON.stringify(settings));
-  }, [settings]);
-
-  // Effects
-  useEffect(() => {
-    // Load history from local storage (mock)
     const saved = localStorage.getItem('chat_history');
     if (saved) {
       const parsed = JSON.parse(saved);
@@ -107,7 +103,7 @@ const App: React.FC = () => {
     scrollToBottom();
   }, [currentSessionId, sessions, isLoading]);
 
-  // Helpers
+  // --- Handlers ---
   const currentSession = sessions.find(s => s.id === currentSessionId);
   const currentMessages = currentSession?.messages || [];
 
@@ -135,10 +131,18 @@ const App: React.FC = () => {
     }
   };
 
+  const handleUpdateAgents = (newAgents: N8nAgent[]) => {
+      setSettings(prev => ({ ...prev, n8nAgents: newAgents }));
+      
+      const currentAgent = newAgents.find(a => a.id === selectedModel);
+      if (selectedModel.startsWith('n8n-') && (!currentAgent || !currentAgent.isActive)) {
+          setSelectedModel(ModelId.GEMINI_FLASH);
+      }
+  };
+
   const updateSessionMessages = (sessionId: string, newMessages: Message[]) => {
     setSessions(prev => prev.map(session => {
       if (session.id === sessionId) {
-        // Update title if first message
         let title = session.title;
         if (session.messages.length === 0 && newMessages.length > 0) {
           title = newMessages[0].text.slice(0, 30) + (newMessages[0].text.length > 30 ? '...' : '');
@@ -155,8 +159,7 @@ const App: React.FC = () => {
       const reader = new FileReader();
       reader.onload = (ev) => {
         const result = ev.target?.result as string;
-        // extract base64 data
-        setAttachedImages(prev => [...prev, result]); // Keep full data URL for display
+        setAttachedImages(prev => [...prev, result]);
       };
       reader.readAsDataURL(file);
     }
@@ -183,19 +186,17 @@ const App: React.FC = () => {
     try {
       let responseText = '';
       const rawImages = userMessage.images?.map(img => img.split(',')[1]) || [];
-
-      // Check if selected model is a custom n8n agent
       const customAgent = settings.n8nAgents?.find(a => a.id === selectedModel);
 
       if (customAgent) {
         responseText = await sendMessageToN8N(userMessage.text, customAgent, updatedMessages);
       } else {
-        // Standard Gemini Models
         responseText = await generateGeminiResponse(
           selectedModel, 
           userMessage.text, 
           rawImages, 
-          settings.systemInstruction
+          settings.systemInstruction,
+          settings.geminiApiKey // BYOK Override
         );
       }
 
@@ -223,19 +224,15 @@ const App: React.FC = () => {
   };
 
   const renderMessageContent = (msg: Message) => {
-    // Basic image rendering for user uploads
     const userImages = msg.images?.map((img, idx) => (
         <img key={idx} src={img} alt="uploaded" className="max-w-xs rounded-xl border border-gray-200 dark:border-gray-700 mb-3 shadow-md" />
     ));
 
-    // Check for Markdown images in text (Generated/Edited images)
-    // Format: ![Alt](data:image/...)
     const imgRegex = /!\[.*?\]\((data:image\/.*?;base64,.*?)\)/g;
     const parts = [];
     let lastIndex = 0;
     let match;
 
-    // This simple parser splits text and image parts
     while ((match = imgRegex.exec(msg.text)) !== null) {
         if (match.index > lastIndex) {
             parts.push(<span key={lastIndex} className="whitespace-pre-wrap">{msg.text.substring(lastIndex, match.index)}</span>);
@@ -261,30 +258,30 @@ const App: React.FC = () => {
     );
   };
 
-  // Get Display Name for Selected Model
   const getModelDisplayName = () => {
       const agent = settings.n8nAgents?.find(a => a.id === selectedModel);
       if (agent) return agent.name;
 
       switch (selectedModel) {
-          case ModelId.GEMINI_FLASH: return 'Gemini 2.5 Flash';
-          case ModelId.GEMINI_PRO: return 'Gemini 3.0 Pro';
+          case ModelId.GEMINI_FLASH: return 'Gemini 3 Flash';
+          case ModelId.GEMINI_PRO: return 'Gemini 3 Pro';
           case ModelId.IMAGEN: return 'Imagen 4.0';
           case ModelId.GEMINI_EDIT: return 'Edit Image';
           default: return 'Select Model';
       }
   };
 
+  const activeAgents = settings.n8nAgents.filter(a => a.isActive);
+
   return (
     <div className="flex h-screen bg-gray-50 dark:bg-gray-950 text-gray-900 dark:text-white font-sans overflow-hidden transition-colors duration-300">
-      {/* Voice Mode Overlay */}
       <VoiceMode 
         isOpen={isVoiceModeOpen} 
         onClose={() => setIsVoiceModeOpen(false)} 
         systemInstruction={settings.systemInstruction}
+        userKey={settings.geminiApiKey}
       />
 
-      {/* Settings Modal */}
       {isSettingsOpen && (
         <SettingsModal 
           settings={settings} 
@@ -293,7 +290,14 @@ const App: React.FC = () => {
         />
       )}
 
-      {/* Sidebar */}
+      {isModelsOpen && (
+        <ModelsModal
+          agents={settings.n8nAgents}
+          onUpdateAgents={handleUpdateAgents}
+          onClose={() => setIsModelsOpen(false)}
+        />
+      )}
+
       <div className={`transition-all duration-300 ease-in-out ${isSidebarOpen ? 'w-72' : 'w-0'} overflow-hidden flex-shrink-0 relative border-r border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 shadow-xl z-20`}>
         <ChatHistory
           sessions={sessions}
@@ -302,14 +306,16 @@ const App: React.FC = () => {
           onNewSession={createNewSession}
           onDeleteSession={deleteSession}
           onOpenSettings={() => setIsSettingsOpen(true)}
+          onOpenModels={() => setIsModelsOpen(true)}
           isOpen={isSidebarOpen}
+          n8nAgents={settings.n8nAgents}
+          selectedModel={selectedModel}
+          onSelectModel={setSelectedModel}
+          hasUserApiKey={!!settings.geminiApiKey}
         />
       </div>
 
-      {/* Main Chat Area */}
       <div className="flex-1 flex flex-col h-full relative min-w-0 bg-gray-50 dark:bg-gray-950">
-        
-        {/* Header */}
         <header className="h-16 flex items-center justify-between px-6 z-10 glass-panel sticky top-0 border-b border-gray-200/50 dark:border-gray-800/50 shadow-sm">
           <div className="flex items-center gap-4">
             <button 
@@ -319,7 +325,6 @@ const App: React.FC = () => {
               <Menu size={20} />
             </button>
             
-            {/* Model Selector */}
             <div className="relative group">
               <div className="flex items-center gap-2 bg-gray-100 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 px-4 py-2 rounded-full text-sm cursor-pointer hover:border-blue-500 dark:hover:border-blue-500 transition-all shadow-sm">
                 <Bot size={16} className={`${selectedModel.startsWith('n8n-') ? 'text-orange-500' : 'text-blue-500'}`} />
@@ -331,18 +336,18 @@ const App: React.FC = () => {
               
               <div className="absolute top-full left-0 mt-2 w-64 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-2xl shadow-2xl overflow-hidden hidden group-hover:block z-50 animate-in fade-in slide-in-from-top-2">
                 <div className="p-2 max-h-[80vh] overflow-y-auto">
-                    <div className="text-xs font-bold text-gray-400 px-3 py-2 uppercase tracking-wider">Models</div>
-                    <button onClick={() => setSelectedModel(ModelId.GEMINI_FLASH)} className="w-full text-left px-3 py-2.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-800 rounded-xl flex items-center gap-3 text-gray-700 dark:text-gray-300"><Sparkles size={16} className="text-purple-500"/> Gemini 2.5 Flash</button>
-                    <button onClick={() => setSelectedModel(ModelId.GEMINI_PRO)} className="w-full text-left px-3 py-2.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-800 rounded-xl flex items-center gap-3 text-gray-700 dark:text-gray-300"><Bot size={16} className="text-blue-500"/> Gemini 3.0 Pro</button>
+                    <div className="text-xs font-bold text-gray-400 px-3 py-2 uppercase tracking-wider">Base Models</div>
+                    <button onClick={() => setSelectedModel(ModelId.GEMINI_FLASH)} className="w-full text-left px-3 py-2.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-800 rounded-xl flex items-center gap-3 text-gray-700 dark:text-gray-300"><Sparkles size={16} className="text-purple-500"/> Gemini 3 Flash</button>
+                    <button onClick={() => setSelectedModel(ModelId.GEMINI_PRO)} className="w-full text-left px-3 py-2.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-800 rounded-xl flex items-center gap-3 text-gray-700 dark:text-gray-300"><Bot size={16} className="text-blue-500"/> Gemini 3 Pro</button>
                     
-                    <div className="text-xs font-bold text-gray-400 px-3 py-2 uppercase tracking-wider mt-2">Tools</div>
+                    <div className="text-xs font-bold text-gray-400 px-3 py-2 uppercase tracking-wider mt-2">Capabilities</div>
                     <button onClick={() => setSelectedModel(ModelId.IMAGEN)} className="w-full text-left px-3 py-2.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-800 rounded-xl flex items-center gap-3 text-gray-700 dark:text-gray-300"><ImageIcon size={16} className="text-green-500"/> Imagen 4.0</button>
                     <button onClick={() => setSelectedModel(ModelId.GEMINI_EDIT)} className="w-full text-left px-3 py-2.5 text-sm hover:bg-gray-100 dark:hover:bg-gray-800 rounded-xl flex items-center gap-3 text-gray-700 dark:text-gray-300"><Sparkles size={16} className="text-pink-500"/> Edit Image</button>
 
-                    {settings.n8nAgents && settings.n8nAgents.length > 0 && (
+                    {activeAgents.length > 0 && (
                         <>
-                            <div className="text-xs font-bold text-gray-400 px-3 py-2 uppercase tracking-wider mt-2">Agents</div>
-                            {settings.n8nAgents.map(agent => (
+                            <div className="text-xs font-bold text-gray-400 px-3 py-2 uppercase tracking-wider mt-2">Custom Models</div>
+                            {activeAgents.map(agent => (
                                 <button 
                                     key={agent.id} 
                                     onClick={() => setSelectedModel(agent.id)} 
@@ -370,7 +375,6 @@ const App: React.FC = () => {
           </div>
         </header>
 
-        {/* Messages */}
         <div className="flex-1 overflow-y-auto p-4 space-y-8 scroll-smooth">
           {currentMessages.length === 0 && (
             <div className="flex flex-col items-center justify-center h-full text-gray-400 dark:text-gray-600 animate-fade-in">
@@ -410,11 +414,8 @@ const App: React.FC = () => {
           <div ref={messagesEndRef} />
         </div>
 
-        {/* Input Area */}
         <div className="p-6 glass-panel sticky bottom-0 z-20">
           <div className="max-w-4xl mx-auto relative">
-            
-            {/* Attached Images Preview */}
             {attachedImages.length > 0 && (
               <div className="absolute bottom-full left-0 mb-4 flex gap-3 p-2 bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-700 shadow-xl overflow-x-auto animate-slide-up">
                 {attachedImages.map((img, idx) => (
